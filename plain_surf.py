@@ -11,6 +11,8 @@ v4.1: 実データ対応の堅牢化。欠測null・取得失敗をポイント�
 v4.2: HTMLをライトテーマのカード型UIに刷新。波高の体感換算
       (スネ/ヒザ/モモ/コシ/ハラ/ムネ/カタ/アタマ)を全チャネルに追加。
       ※体感換算は単位換算でありプレーン原則(評価を入れない)に反しない。
+v4.3: 「伝搬 沖→岸」ミニバーを追加。150→90→40→15km→岸のうねり高を
+      並べ、経路上の遮蔽・減衰(段差が落ちる形)を視覚化。透過率%を統合。
 
 使い方: python3 plain_surf.py                     # 明日・全27ポイント・stdoutのみ
         python3 plain_surf.py --today             # 今日
@@ -225,6 +227,7 @@ def build_report(spot, target):
         sw_d = hv(beach, "swell_wave_direction", i)
 
         ring_cells = []
+        path_vals = []  # (距離km, うねり高) 遮蔽の視覚化用
         outer_h = None
         outer_t = None
         outer_dist = None
@@ -234,6 +237,7 @@ def build_report(spot, target):
             rt = hv(ring["data"], "swell_wave_period", j)
             if rh is not None:
                 outer_h, outer_t, outer_dist = rh, rt, ring["dist"]  # 値のある最遠リングを採用
+            path_vals.append((ring["dist"], rh))
             ring_cells.append(f"{fmt(rh, '.2f')}m/{fmt(rt, '.0f')}s"
                               if rh is not None else "--")
 
@@ -264,6 +268,7 @@ def build_report(spot, target):
         )
         data_rows.append({
             "time": f"{h:02d}:00", "hs": hs, "size": size,
+            "sw_h": sw_h, "path": path_vals,
             "swell": (f"{fmt(sw_h, '.2f', 'm')}/{fmt(sw_t, '.1f', 's')} "
                       f"{compass(sw_d)}") if sw_h is not None else "--",
             "outer": (f"{outer_h:.2f}m/{fmt(outer_t, '.0f', 's')} @{outer_dist}km"
@@ -344,6 +349,35 @@ def deliver_line(compact_text):
 WIND_TAG = {"オフ": ("#1a7f4e", "#e2f4ea"), "オン": ("#b25a00", "#fdeeda"),
             "サイド": ("#5a6b7a", "#eceff2"), "--": ("#98a4ae", "#f1f4f6")}
 
+PATH_RING = "#a9cfec"   # 伝搬バー: 沖リング(同一ヒューの淡ステップ)
+PATH_BEACH = "#1a78c2"  # 伝搬バー: 岸格子(アクセント)
+PATH_NULL = "#dde6ee"   # 欠測スロット
+
+
+def path_svg(path_vals, beach_h, card_max):
+    """沖→岸のうねり高ミニバー。左=最遠リング、右端の濃い棒=岸格子。
+    途中でガクッと落ちる形=経路上の遮蔽・減衰がそのまま見える"""
+    slots = list(reversed(path_vals)) + [("岸", beach_h)]  # 遠→近
+    bw, gap, H, base = 8, 2, 22, 20
+    W = len(slots) * bw + (len(slots) - 1) * gap
+    parts = [f'<svg class="pathsvg" width="{W}" height="{H}" '
+             f'viewBox="0 0 {W} {H}" role="img">']
+    for k, (dist, v) in enumerate(slots):
+        x = k * (bw + gap)
+        name = f"{dist}km沖" if dist != "岸" else "岸格子"
+        if v is None:
+            parts.append(f'<rect x="{x}" y="{base-2}" width="{bw}" height="2" '
+                         f'fill="{PATH_NULL}"><title>{name}: 欠測</title></rect>')
+            continue
+        h = max(2, round(v / card_max * 18)) if card_max > 0 else 2
+        color = PATH_BEACH if dist == "岸" else PATH_RING
+        parts.append(f'<rect x="{x}" y="{base-h}" width="{bw}" height="{h}" '
+                     f'rx="1.5" fill="{color}">'
+                     f'<title>{name}: {v:.2f}m</title></rect>')
+    parts.append(f'<line x1="0" y1="{base}" x2="{W}" y2="{base}" '
+                 'stroke="#e3ebf1" stroke-width="1"/></svg>')
+    return "".join(parts)
+
 
 def write_html(path, pages, target):
     """構造化データからライトテーマのカード型ページを生成"""
@@ -374,6 +408,9 @@ tr:last-child td{border-bottom:none}
 .tag{display:inline-block;border-radius:4px;padding:.05rem .4rem;
   font-size:.72rem;font-weight:600;margin-left:.3rem}
 .ratio{font-weight:600}
+.pct{font-weight:600;font-size:.78rem;margin-left:.4rem;
+  font-variant-numeric:tabular-nums}
+.pathsvg{vertical-align:middle}
 .err{color:#b0483f;font-size:.85rem}
 details{margin-top:.5rem;font-size:.72rem;color:var(--sub)}
 .legend{display:flex;flex-wrap:wrap;gap:.35rem;margin:.5rem 0}
@@ -398,23 +435,30 @@ details{margin-top:.5rem;font-size:.72rem;color:var(--sub)}
             f'<span class="meta">うねり主方位 {p["bearing"]} ・ '
             f'岸格子 {p["grid"]}</span></div><div class="tblwrap"><table>'
             '<thead><tr><th>時刻</th><th>サイズ(有義波高)</th><th>風</th>'
-            '<th>うねり(岸格子)</th><th>沖の生値</th><th>透過率</th>'
+            '<th>伝搬 沖→岸</th>'
+            '<th>うねり(岸格子)</th><th>沖の生値</th>'
             '</tr></thead><tbody>')
+        card_max = max([v for r in p["rows"] for _, v in r.get("path", [])
+                        if v is not None]
+                       + [r["sw_h"] for r in p["rows"] if r.get("sw_h") is not None]
+                       + [0.01])
         for r in p["rows"]:
             label, bg, fg = r["size"]
             size_cell = (f'<span class="chip" style="background:{bg};'
                          f'color:{fg}">{label}'
                          + (f' {r["hs"]:.2f}m' if r["hs"] is not None else "")
                          + "</span>")
-            ratio_cell = (f'<span class="ratio">{r["ratio"]*100:.0f}%</span>'
-                          if r["ratio"] is not None else "--")
+            pct = (f'<span class="pct">{r["ratio"]*100:.0f}%</span>'
+                   if r["ratio"] is not None else '<span class="pct">--</span>')
+            path_cell = (path_svg(r.get("path", []), r.get("sw_h"), card_max)
+                         + pct)
             wfg, wbg = WIND_TAG.get(r["wtype"], WIND_TAG["--"])
             wind_cell = (r["wind"] + (f'<span class="tag" style="color:{wfg};'
                                       f'background:{wbg}">{r["wtype"]}</span>'
                                       if r["wind"] != "--" else ""))
             body.append(f'<tr><td>{r["time"]}</td><td>{size_cell}</td>'
-                        f'<td>{wind_cell}</td><td>{r["swell"]}</td>'
-                        f'<td>{r["outer"]}</td><td>{ratio_cell}</td></tr>')
+                        f'<td>{wind_cell}</td><td>{path_cell}</td>'
+                        f'<td>{r["swell"]}</td><td>{r["outer"]}</td></tr>')
         rings_txt = " / ".join(f"{d}km沖: {g}" for d, g in p["ring_grids"])
         body.append('</tbody></table></div>'
                     f'<details><summary>リング格子座標</summary>{rings_txt}'
@@ -428,8 +472,11 @@ details{margin-top:.5rem;font-size:.72rem;color:var(--sub)}
         f'<div class="legend">{legend}</div>'
         '<div class="note">サイズは岸格子の有義波高をそのまま体感ラベルに換算した値。'
         '格子は約8kmで岸から離れた沖の値のため、実際のセットフェイスは地形・周期で'
-        'これより上下する。透過率 = 岸格子うねり高 ÷ うねり方位に沿って遡った'
-        '最遠リングのうねり高(モデルの陸地遮蔽・減衰込みの実効値)。'
+        'これより上下する。<br>「伝搬 沖→岸」のバーは、うねりの来る方位に沿って'
+        '150→90→40→15km沖と遡ったうねり高(淡色)と岸格子(濃色)。'
+        '左から右へ段差がガクッと落ちる形=経路の途中で陸に遮蔽・減衰されて'
+        '浜まで届いていない。%は透過率(岸格子うねり高÷最遠リングうねり高、'
+        'モデルの陸地遮蔽・減衰込みの実効値)。バーにマウスを乗せると実値。'
         '風のオフ/オン/サイドはビーチ正面方位との幾何計算。評価・予想は含まない。</div>'
         "</div>")
     html = ('<!doctype html><html lang="ja"><head><meta charset="utf-8">'
