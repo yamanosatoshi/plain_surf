@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-plain_surf.py v3 — 座標だけから出すプレーン波予測(人間の評価・スコアなし)
+plain_surf.py v4.1 — 座標だけから出すプレーン波予測(人間の評価・スコアなし)
 
 v2: うねりの来る方位に沿って沖を遡ってサンプリングし、
     モデルが計算済みの減衰(遮蔽込み)を「透過率」として表示する。
-v3: 配信アダプタ追加。同じ1回の実行結果を Slack / LINE / HTML に配る。
-    - 環境変数 SLACK_WEBHOOK_URL があれば Slack Incoming Webhook へ投稿
-    - 環境変数 LINE_CHANNEL_ACCESS_TOKEN があれば LINE公式アカウントで
-      broadcast (友だち全員へプッシュ。等幅が崩れるためコンパクト表記)
-    - --html <path> で閲覧用HTMLを書き出し (GitHub Pages 用)
+v3: 配信アダプタ (Slack Webhook / LINE broadcast / HTML)
+v4: 8エリア27ポイント + リング15/40/90/150km + --areaフィルタ
+v4.1: 実データ対応の堅牢化。欠測null・取得失敗をポイント単位で隔離し、
+      1ポイントの失敗で全体が落ちない構造に変更。
 
-データ: Open-Meteo Marine API (波・うねり: ECMWF WAM / MFWAM 等)
-       Open-Meteo JMA API   (風: 気象庁MSM 5km)
 使い方: python3 plain_surf.py                     # 明日・全27ポイント・stdoutのみ
         python3 plain_surf.py --today             # 今日
         python3 plain_surf.py --area 京丹後        # エリア/ポイント名で絞り込み(部分一致)
@@ -24,6 +21,7 @@ import json
 import math
 import os
 import sys
+import time
 import urllib.request
 from datetime import date, timedelta
 
@@ -87,9 +85,24 @@ COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
 
-def fetch(url):
-    with urllib.request.urlopen(url, timeout=20) as r:
-        return json.loads(r.read())
+def fetch(url, retries=2):
+    """JSON取得。失敗はリトライし、最終的にNoneを返す(呼び出し側で欠測扱い)"""
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = json.loads(r.read())
+            if isinstance(data, dict) and "hourly" in data:
+                return data
+            return None  # エラーJSON等
+        except Exception:
+            if attempt < retries:
+                time.sleep(3 * (attempt + 1))
+    return None
+
+
+def fmt(v, spec, suffix=""):
+    """None安全なフォーマット。実データは欠測nullを含む"""
+    return "--" if v is None else format(v, spec) + suffix
 
 
 def compass(deg):
@@ -125,9 +138,19 @@ def forward_point(lat, lon, bearing_deg, dist_km):
 
 
 def hour_index(data, target, hour):
+    if not data:
+        return None
     t = f"{target}T{hour:02d}:00"
-    times = data["hourly"]["time"]
+    times = data["hourly"].get("time", [])
     return times.index(t) if t in times else None
+
+
+def hv(data, key, idx):
+    """hourly値のNone安全な取り出し"""
+    if data is None or idx is None:
+        return None
+    arr = data["hourly"].get(key)
+    return arr[idx] if arr and idx < len(arr) else None
 
 
 def median(xs):
@@ -138,12 +161,14 @@ def median(xs):
 def build_report(spot, target):
     beach = fetch(MARINE_URL.format(lat=spot["lat"], lon=spot["lon"]))
     wind = fetch(WIND_URL.format(lat=spot["lat"], lon=spot["lon"]))
+    head = f"◆ {spot['area']}/{spot['name']}  {target}"
+    if beach is None:
+        line = head + "  [海況データ取得失敗]"
+        return line, line, []
 
     # その日のうねり方位の中央値 → 遡る方向を決める
     idxs = [hour_index(beach, target, h) for h in HOURS]
-    swell_dirs = [beach["hourly"]["swell_wave_direction"][i]
-                  for i in idxs if i is not None]
-    up_bearing = median(swell_dirs)  # うねりが「来る」方位 = そちらへ進めば沖
+    up_bearing = median([hv(beach, "swell_wave_direction", i) for i in idxs])
 
     rings = []
     if up_bearing is not None:
@@ -153,9 +178,10 @@ def build_report(spot, target):
                 MARINE_URL.format(lat=f"{rla:.4f}", lon=f"{rlo:.4f}"))})
 
     lines = [
-        f"◆ {spot['area']}/{spot['name']}  {target}  [プレーン予測: モデル値のみ・評価なし]",
+        head + "  [プレーン予測: モデル値のみ・評価なし]",
         f"  岸格子: {beach['latitude']:.3f},{beach['longitude']:.3f}"
-        f"  / うねり主方位 {compass(up_bearing)}({up_bearing:.0f}°)に沿って沖を遡り",
+        + (f"  / うねり主方位 {compass(up_bearing)}({up_bearing:.0f}°)に沿って沖を遡り"
+           if up_bearing is not None else "  / うねりデータ欠測"),
         "  時刻   有義波高  周期    うねり(岸格子)        "
         + "".join(f"{d}km沖    " for d in RINGS_KM) + "透過率   風",
     ]
@@ -165,53 +191,59 @@ def build_report(spot, target):
         i = hour_index(beach, target, h)
         if i is None:
             continue
-        bh = beach["hourly"]
-        sw_h = bh["swell_wave_height"][i]
-        sw_t = bh["swell_wave_period"][i]
-        sw_d = bh["swell_wave_direction"][i]
+        sw_h = hv(beach, "swell_wave_height", i)
+        sw_t = hv(beach, "swell_wave_period", i)
+        sw_d = hv(beach, "swell_wave_direction", i)
 
         ring_cells = []
         outer_h = None
         for ring in rings:
             j = hour_index(ring["data"], target, h)
-            rh = ring["data"]["hourly"]["swell_wave_height"][j] if j is not None else None
-            rt = ring["data"]["hourly"]["swell_wave_period"][j] if j is not None else None
-            outer_h = rh if rh is not None else outer_h  # 最遠リングを採用
-            ring_cells.append(f"{rh:.2f}m/{rt:.0f}s" if rh is not None else "--")
+            rh = hv(ring["data"], "swell_wave_height", j)
+            rt = hv(ring["data"], "swell_wave_period", j)
+            if rh is not None:
+                outer_h = rh  # 値のある最遠リングを採用
+            ring_cells.append(f"{fmt(rh, '.2f')}m/{fmt(rt, '.0f')}s"
+                              if rh is not None else "--")
 
-        ratio = (sw_h / outer_h) if (outer_h and outer_h > 0.05 and sw_h is not None) else None
-        ratio_s = f"{ratio*100:3.0f}%" if ratio is not None else " --"
+        ratio = None
+        if outer_h is not None and outer_h > 0.05 and sw_h is not None:
+            ratio = sw_h / outer_h
 
         wj = hour_index(wind, target, h)
-        if wj is not None:
-            wd = wind["hourly"]["wind_direction_10m"][wj]
-            ws = wind["hourly"]["wind_speed_10m"][wj]
-            wind_s = f"{compass(wd)} {ws:.1f}m/s ({wind_label(wd, spot['facing'])})"
-        else:
-            wind_s = "--"
+        wd = hv(wind, "wind_direction_10m", wj)
+        ws = hv(wind, "wind_speed_10m", wj)
+        wind_s = (f"{compass(wd)} {ws:.1f}m/s ({wind_label(wd, spot['facing'])})"
+                  if (wd is not None and ws is not None) else "--")
 
         lines.append(
-            f"  {h:02d}:00  {bh['wave_height'][i]:.2f}m    {bh['wave_period'][i]:.1f}s   "
-            f"{sw_h:.2f}m/{sw_t:.1f}s {compass(sw_d)}({sw_d:.0f}°)  "
+            f"  {h:02d}:00  {fmt(hv(beach, 'wave_height', i), '.2f', 'm')}    "
+            f"{fmt(hv(beach, 'wave_period', i), '.1f', 's')}   "
+            f"{fmt(sw_h, '.2f', 'm')}/{fmt(sw_t, '.1f', 's')} "
+            f"{compass(sw_d)}({fmt(sw_d, '.0f', '°')})  "
             + "".join(f"{c:<10}" for c in ring_cells)
-            + f"{ratio_s}    {wind_s}"
+            + (f"{ratio*100:3.0f}%" if ratio is not None else " --")
+            + f"    {wind_s}"
         )
         compact.append(
-            f"{h:02d}時 {sw_h:.2f}m/{sw_t:.0f}s{compass(sw_d)}"
+            f"{h:02d}時 {fmt(sw_h, '.2f')}m/{fmt(sw_t, '.0f')}s{compass(sw_d)}"
             + (f" 沖{outer_h:.2f}m透過{ratio*100:.0f}%" if ratio is not None else "")
             + f" 風{wind_s.replace(' ', '').replace('m/s', '')}"
         )
         log_rows.append([target, f"{h:02d}:00", spot["name"],
-                         f"{sw_d:.0f}" if sw_d is not None else "",
-                         f"{outer_h:.2f}" if outer_h is not None else "",
-                         f"{sw_h:.2f}" if sw_h is not None else "",
+                         fmt(sw_d, ".0f") if sw_d is not None else "",
+                         fmt(outer_h, ".2f") if outer_h is not None else "",
+                         fmt(sw_h, ".2f") if sw_h is not None else "",
                          f"{ratio:.2f}" if ratio is not None else ""])
 
     for ring in rings:
-        lines.append(f"  ({ring['dist']}km沖の格子: "
-                     f"{ring['data']['latitude']:.3f},{ring['data']['longitude']:.3f}"
-                     " — 陸に近い場合は格子スナップに注意)")
-    lines.append("  ※透過率 = 岸格子うねり高 ÷ 最遠リングうねり高。"
+        if ring["data"] is not None:
+            lines.append(f"  ({ring['dist']}km沖の格子: "
+                         f"{ring['data']['latitude']:.3f},{ring['data']['longitude']:.3f}"
+                         " — 陸に近い場合は格子スナップに注意)")
+        else:
+            lines.append(f"  ({ring['dist']}km沖: データ取得失敗)")
+    lines.append("  ※透過率 = 岸格子うねり高 ÷ 値のある最遠リングのうねり高。"
                  "モデルの陸地遮蔽・減衰を織り込んだ実効値")
     return "\n".join(lines), "\n".join(compact), log_rows
 
@@ -271,6 +303,8 @@ line-height:1.6}}h1{{font-size:1rem;color:#7fb8d8}}</style></head>
 
 
 def append_log(rows):
+    if not rows:
+        return
     new = not os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
         w = csv.writer(f)
@@ -288,19 +322,34 @@ def main():
         area = sys.argv[sys.argv.index("--area") + 1]
     spots = [s for s in SPOTS
              if area is None or area in s["area"] or area in s["name"]]
-    reports, compacts = [], []
+
+    reports, compacts, failures = [], [], 0
     for spot in spots:
-        report, compact, log_rows = build_report(spot, target)
+        try:
+            report, compact, log_rows = build_report(spot, target)
+            append_log(log_rows)
+        except Exception as e:  # 1ポイントの想定外エラーで全体を落とさない
+            report = compact = (f"◆ {spot['area']}/{spot['name']}  {target}"
+                                f"  [エラー: {type(e).__name__}: {e}]")
+            failures += 1
         print(report + "\n")
         reports.append(report)
         compacts.append(compact)
-        append_log(log_rows)
 
     full = "\n\n".join(reports)
-    deliver_slack(full)
-    deliver_line("\n\n".join(compacts))
+    try:
+        deliver_slack(full)
+    except Exception as e:
+        print(f"[slack配信失敗: {e}]")
+    try:
+        deliver_line("\n\n".join(compacts))
+    except Exception as e:
+        print(f"[line配信失敗: {e}]")
     if "--html" in sys.argv:
         write_html(sys.argv[sys.argv.index("--html") + 1], full, target)
+
+    if failures == len(spots):  # 全滅のときだけ失敗扱い
+        sys.exit(1)
 
 
 if __name__ == "__main__":
