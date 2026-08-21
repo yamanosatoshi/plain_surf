@@ -1,0 +1,25 @@
+# .github/workflows/surf.yml — 毎朝5時(JST)にプレーン波予測を配信
+name: surf-forecast
+on:
+  schedule:
+    - cron: "0 20 * * *"   # 20:00 UTC = 翌朝 05:00 JST
+  workflow_dispatch: {}     # 手動実行ボタン
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: run forecast + deliver
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+        run: python3 plain_surf.py --html docs/index.html
+      - name: commit html + transmission log
+        run: |
+          git config user.name surf-bot
+          git config user.email surf-bot@users.noreply.github.com
+          git add docs/index.html plain_surf_log.csv
+          git commit -m "forecast $(date -u +%F)" || echo "no changes"
+          git push
